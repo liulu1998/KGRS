@@ -67,8 +67,6 @@ class GATLayer(nn.Module):
         :param t: (batch, max_i_r, in)
         :param mask: (batch, max_i_r)
         """
-        # q: 注意力权重没有考虑 h, 只与 r, t 有关, 即只考虑了 r 和 t 的交互, 未考虑 实体与实体 的特征相似性
-        # score = softmax( h(W(r · t) + b))
         score = self.activation(self.W(r * t) + self.bias)
         score = torch.exp(torch.einsum("abc, ck->abk", score, self.h))
         score = torch.einsum("ab, abc->abc", mask, score)
@@ -108,8 +106,6 @@ class GAT(nn.Module):
         """
         head_dim = 1
         out = torch.stack([att(item, r, t, mask) for att in self.attentions], dim=head_dim)  # [batch, head, emb]
-        # Regularization
-        # diff_loss = self.diff_outputs(out)
 
         # avg
         out = torch.torch.mean(out, dim=head_dim)
@@ -121,29 +117,6 @@ class GAT(nn.Module):
         for att in self.attentions:
             loss = loss + att.L2()
         return loss
-
-    @staticmethod
-    def diff_outputs(inputs):
-        """
-        Calculate the differences of all heads outputs
-        :param inputs: A tensor with shape [batch, heads, q_length, channels]
-        我的输入是 3D Tensor, [batch, heads, embedding size]
-        :param name: An optional string
-        :returns: A tensor with shape [batch, q_length]
-        # x = torch.transpose(x, 1, 2)  # [batch, emb, head] no need
-        """
-        x = inputs  # [batch, head, emb]
-        x = F.normalize(x, dim=-1, p=2)  # normalize the last dimension
-        x1 = torch.unsqueeze(x, dim=1)  # [batch, 1, head, emb]
-        x2 = torch.unsqueeze(x, dim=2)  # [batch, head, 1, emb]
-
-        # 余弦值 越接近 1, 向量越相似
-        cos_diff = torch.sum(torch.mul(x1, x2), dim=-1)  # [batch, head, head]
-
-        cos_diff = torch.mean(cos_diff, dim=[-2, -1])  # [batch]
-
-        cos_diff = torch.sum(cos_diff)
-        return cos_diff
 
 
 class KGRS(nn.Module):
@@ -201,11 +174,6 @@ class KGRS(nn.Module):
         # embedding layers
         self.User = nn.Embedding(self.n_users + 1, self.emb_size)
 
-        """
-        Head 和 Tail 的前部分 嵌入向量 ( 0 ~ n_items - 1 行), 都是 能映射为 item 的 entities
-        n_items ~ n_entities - 1 行, 都是不能映射为 item 的 entities, 即属性值
-        最后是 填充值 的嵌入向量
-        """
         # >>> SimplE as KGE model
         self.Head = nn.Embedding(max(self.n_items, self.n_entities) + 1, self.emb_size)
         self.Tail = nn.Embedding(max(self.n_items, self.n_entities) + 1, self.emb_size)
@@ -237,10 +205,10 @@ class KGRS(nn.Module):
             if isinstance(layer, nn.Embedding):
                 nn.init.trunc_normal_(tensor=layer.weight, mean=0.0, std=0.01)
 
-    def cal_kg_loss(self, g_hrt, item, item_inv, batch_r, batch_t):
+    def cal_kg_loss(self, score, item, item_inv, batch_r, batch_t):
         """
         calculate StayPositive loss for KG Embedding
-        :param g_hrt, score of triples, 2D Tensor, (batch_size, max_i_r)
+        :param score, score of triples, 2D Tensor, (batch_size, max_i_r)
         :param item, a batch of items' Head Representation
         :param item_inv, a batch of items' Tail Representation
         :param batch_r, a batch of relations, 2D Tensor, size (batch_size, max_i_r)
@@ -262,9 +230,9 @@ class KGRS(nn.Module):
 
         # StayPositive loss
         score_all = torch.mean(torch.stack([
-                torch.einsum("ad,bd,cd->abc", item, r, t),
-                torch.einsum("ad,bd,cd->abc", item_inv, r_inv, h_t)
-            ]), dim=0)
+            torch.einsum("ad,bd,cd->abc", item, r, t),
+            torch.einsum("ad,bd,cd->abc", item_inv, r_inv, h_t)
+        ]), dim=0)
 
         # score_all = torch.sum(torch.mean(
         #     torch.stack([
@@ -273,11 +241,10 @@ class KGRS(nn.Module):
         #     ])
         # ))
         # pos loss + regularization term
-        loss_kg = torch.sum(F.softplus(-(g_hrt + self.psi), threshold=200)) + self.alpha * torch.norm(score_all, p=1)
+        loss_kg = torch.sum(F.softplus(-(score + self.psi), threshold=200)) + self.alpha * torch.norm(score_all, p=1)
         return loss_kg
 
     def cal_squared_cf_loss(self, pre, item, weight):
-        # 运算解耦的 CF 损失
         loss_cf = torch.sum(
             (self.c_v_pos - weight) * torch.pow(pre, 2) - 2.0 * self.c_v_pos * pre
         ) + torch.sum(
@@ -334,35 +301,30 @@ class KGRS(nn.Module):
 
     def infer(self, input_i, input_iu, input_hr, input_ht):
         """
-        :param input_i: items
-        :param input_iu: (batch_size, max_i_u), 里面是对应的 users
-        :param input_hr: (batch_size, max_i_r), 里面都是 对应的 relations
-        :param input_ht: (batch_size, max_i_r),里面都是 对应的 tail entity
+        :param input_i: item ID
+        :param input_iu: (batch_size, max_i_u), corresponding user ID
+        :param input_hr: (batch_size, max_i_r), corresponding relation ID
+        :param input_ht: (batch_size, max_i_r), corresponding tail entity ID
         :return: total loss
         """
-        item_emb = self.Head(input_i).squeeze_()
+        item_emb = self.Head(input_i).squeeze_()  # (batch_size, emb_size)
         item_t_emb = self.Tail(input_i).squeeze_()
-        # (batch_size, emb_size)   (256, 64)
 
         # weights
-        c = self.negative_c[input_i]
+        c = self.negative_c[input_i]  # (batch_size, 1)
         # ck = self.negative_ck[input_i]
-        # c: (batch_size, 1)  ck: (batch_size, 1)
 
         # Dropout
         item_emb_kg = self.dropout_kg(item_emb)
         item_t_emb_kg = self.dropout_kg(item_t_emb)
 
-        # >>> KG, calculate tuples' score
-        # relations, tail entities
-        r_emb = self.R(input_hr)
+        # >> KG, calculate tuples' score
+        # r and r^{-1}
+        r_emb = self.R(input_hr)  # (batch_size, max_i_r, emb_size)
         r_inv_emb = self.R_inv(input_hr)
 
-        t_emb = self.Tail(input_ht)
-        # t_h_emb 是 tail entities 作为 head 时的 嵌入矩阵
+        t_emb = self.Tail(input_ht)  # (batch_size, max_i_r, emb_size)
         t_h_emb = self.Head(input_ht)
-        # r_emb: 3D, (batch, max_i_r, emb_size)
-        # t_emb: 3D, (batch, max_i_r, emb_size)
 
         # mask
         mask = torch.ne(input_hr, self.n_relations).float()
@@ -374,45 +336,52 @@ class KGRS(nn.Module):
 
         # SimplE scoring function
         pos_rt = pos_r_emb * pos_t_emb
-        pos_rt_inv = pos_r_inv_emb * pos_t_h_emb
-        pos_hrt_inv = torch.einsum("ac, abc->ab", item_t_emb_kg, pos_rt_inv).squeeze_()
+        pos_hrt = torch.einsum("ac, abc->ab", item_emb_kg, pos_rt).squeeze_()  # (batch_size, max_i_r)
 
-        # pos_hrt is g_{hrt}^{\prime} in paper
-        pos_hrt = torch.einsum("ac, abc->ab", item_emb_kg, pos_rt).squeeze_()
-        # (batch, max_i_r)
+        pos_rt_inv = pos_r_inv_emb * pos_t_h_emb
+        pos_hrt_inv = torch.einsum("ac, abc->ab", item_t_emb_kg, pos_rt_inv).squeeze_()  # (batch_size, max_i_r)
+
         # tuples' score
-        g_hrt = torch.mean(torch.stack([pos_hrt, pos_hrt_inv]), dim=0)
+        tuple_score = torch.mean(torch.stack([pos_hrt, pos_hrt_inv]), dim=0)  # (batch_size, max_i_r)
         # <<< SimplE scoring function
 
-        loss_kg = self.cal_kg_loss(g_hrt=g_hrt, item=item_emb_kg, item_inv=item_t_emb_kg,
+        # loss on Knowledge Graph Embedding task
+        loss_kg = self.cal_kg_loss(score=tuple_score, item=item_emb_kg, item_inv=item_t_emb_kg,
                                    batch_r=input_hr, batch_t=input_ht)
-        # <<< KG
+        # << KG
 
-        # >> CF,  cal \hat y_{uv}
+        # >> CF, predict user-item preference
         # information 1
-        item_emb_cf = self.dropout_cf(item_emb)  # basic embeddings
-        item_emb_qv = self.GAT(item=item_emb_cf, r=pos_r_emb, t=pos_t_emb, mask=mask)
+        item_emb_cf = self.dropout_cf(item_emb)  # basic embedding, (batch_size, emb_size)
+        item_emb_qv = self.GAT(item=item_emb_cf, r=pos_r_emb, t=pos_t_emb,
+                               mask=mask)  # aggregated embedding, (batch_size, emb_size)
 
         # information 2
-        item_emb_cf_inv = self.dropout_cf(item_t_emb)  # basic embeddings
-        item_emb_qv_inv = self.GAT(item=item_emb_cf_inv, r=pos_r_inv_emb, t=pos_t_h_emb, mask=mask)
-        # information fusion
-        item_emb_qv = 0.8 * item_emb_qv + 0.2 * item_emb_qv_inv
+        item_emb_cf_inv = self.dropout_cf(item_t_emb)  # basic embedding, (batch_size, emb_size)
+        item_emb_qv_inv = self.GAT(item=item_emb_cf_inv, r=pos_r_inv_emb, t=pos_t_h_emb,
+                                   mask=mask)  # aggregated embedding, (batch_size, emb_size)
 
-        user_emb = self.User(input_iu)
+        # information fusion
+        item_emb_qv = 0.8 * item_emb_qv + 0.2 * item_emb_qv_inv  # items' final embedding
+
+        user_emb = self.User(input_iu)  # (batch_size, max_i_u, emb_size)
 
         # mask
         pos_num_u = torch.ne(input_iu, self.n_users).float()
         user_emb = torch.einsum("ab, abc->abc", pos_num_u, user_emb)
 
-        # predict \hat y_uv
+        # predict user-item preference
         pos_iu = torch.einsum("ac, abc->abc", item_emb_qv, user_emb)
         pos_iu = torch.einsum("ajk, kl->ajl", pos_iu, self.pre_vec)
         pos_iu = torch.reshape(pos_iu, [-1, self.max_i_u])
-        # << CF,  cal \hat y_{uv}
 
+        # loss on User Preference Prediction task
         loss_cf = self.cal_squared_cf_loss(pre=pos_iu, item=item_emb_qv, weight=c)
+        # << CF
+
+        # L2 regularization
         l2_regular = self.L2()
+
         # multi-task learning loss
         tot_loss = self.weight_kg_loss * loss_kg + self.weight_cf_loss * loss_cf + l2_regular
         return tot_loss, loss_kg.item(), loss_cf.item()

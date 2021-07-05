@@ -266,8 +266,7 @@ class DatasetKGRS(Dataset):
 class TestDataset(Dataset):
     def __init__(self, args, whether_test, item_ids, relation_test, tail_test):
         """
-        测试数据集类, 验证集或测试集
-        :param whether_test: 是否是测试集,
+        :param whether_test:
         :param item_ids:
         :param relation_test:
         :param tail_test:
@@ -277,8 +276,6 @@ class TestDataset(Dataset):
         self.data_dir = os.path.join(data_root, data_name)
         self.batch_size = args.test_batch_size
 
-        # q: 即使在 train set 中划分出了 val set, 这里是否应该加载完整的 train set
-        # 加载 train set 的原因是要计算 filtered Recall 和 NDCG
         train_file = "train.txt" if whether_test else "train2.txt"
         train_file = os.path.join(self.data_dir, train_file)
 
