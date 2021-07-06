@@ -183,17 +183,16 @@ def train_and_test(args):
             tot_loss.backward()
             optimizer.step()
             # record loss on this batch
-            tot_sum += tot_loss
+            tot_sum += tot_loss.item()
             kg_sum += kg_loss
             cf_sum += cf_loss
             steps += 1
         # <<< train_loader
         avg_train_loss, avg_kg_loss, avg_cf_loss = tot_sum / steps, kg_sum / steps, cf_sum / steps
         logging.info(f"epoch {epoch + 1} total loss={avg_train_loss: .2f} KG loss={avg_kg_loss :.2f} CF loss={avg_cf_loss :.2f}")
-    # <<< train
+    # << train
 
-    # test
-    model.eval()
+    # prepare test data
     relation_test, tail_test = dataset.prepare_test()
     relation_test = relation_test.to(device)
     tail_test = tail_test.to(device)
@@ -205,6 +204,8 @@ def train_and_test(args):
                              num_workers=1, pin_memory=True, shuffle=False)
     K = eval(args.Ks)
 
+    # test
+    model.eval()
     with torch.no_grad():
         res = evaluate(
             model=model,

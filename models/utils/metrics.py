@@ -3,12 +3,12 @@ import numpy as np
 from sklearn.metrics import roc_auc_score, log_loss
 
 
-def L2_loss(x):
-    return torch.div(torch.pow(torch.norm(x, 2), 2), 2.0)
+def L2Loss(x):
+    return 0.5 * torch.pow(torch.norm(x, 2), 2)
 
 
-def L2_loss_mean(x):
-    return torch.mean(torch.sum(torch.pow(x, 2), dim=1, keepdim=False) / 2.)
+# def L2_loss_mean(x):
+#     return torch.mean(0.5 * torch.sum(torch.pow(x, 2), dim=1, keepdim=False))
 
 
 def recall(rank, ground_truth, N):

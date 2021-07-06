@@ -2,7 +2,7 @@ from math import sqrt
 import torch
 from torch import nn
 import torch.nn.functional as F
-from models.utils.metrics import L2_loss
+from models.utils.metrics import L2Loss
 
 
 class Aggregator(nn.Module):
@@ -83,7 +83,7 @@ class GATLayer(nn.Module):
         return self.aggregator(item, item_neighbors)
 
     def L2(self):
-        loss = torch.tensor(0., requires_grad=True) + L2_loss(self.W.weight) + L2_loss(self.h)
+        loss = torch.tensor(0., requires_grad=True) + L2Loss(self.W.weight) + L2Loss(self.h)
         return loss
 
 
@@ -256,8 +256,8 @@ class KGRS(nn.Module):
 
     def L2(self):
         """ L2 Regularization """
-        l2_kg = torch.tensor(0., requires_grad=True) + L2_loss(self.User.weight) + L2_loss(self.Head.weight) \
-                + L2_loss(self.Tail.weight) + L2_loss(self.R.weight) + L2_loss(self.R_inv.weight)
+        l2_kg = torch.tensor(0., requires_grad=True) + L2Loss(self.User.weight) + L2Loss(self.Head.weight) \
+                + L2Loss(self.Tail.weight) + L2Loss(self.R.weight) + L2Loss(self.R_inv.weight)
 
         l2_cf = self.GAT.L2()
 
