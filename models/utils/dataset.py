@@ -294,11 +294,10 @@ class TestDataset(Dataset):
         # user ids in test set
         user_ids = torch.LongTensor(list(self.test_user_dict.keys()))
         self.user_ids = user_ids
-        self.n_users = len(self.user_ids)
+        self.n_users = len(self.test_user_dict)
         # user_ids_batches = [user_ids[i: i + self.batch_size] for i in
         #                     range(0, len(user_ids), self.batch_size)]
         # user_ids_batches = [d.to(self.device) for d in user_ids_batches]
-        #
         # self.user_ids_batches = user_ids_batches
 
     def __getitem__(self, index):

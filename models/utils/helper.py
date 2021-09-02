@@ -4,19 +4,6 @@ import torch
 import matplotlib.pyplot as plt
 
 
-def truncated_normal_(tensor, mean=0, std=1):
-    """ initialize weight
-    """
-    with torch.no_grad():
-        size = tensor.shape
-        tmp = tensor.new_empty(size + (4,)).normal_()
-        valid = (tmp < 2) & (tmp > -2)
-        ind = valid.max(-1, keepdim=True)[1]
-        tensor.data.copy_(tmp.gather(-1, ind).squeeze(-1))
-        tensor.data.mul_(std).add_(mean)
-        return tensor
-
-
 def early_stopping(result, threshold: float, evaluate_every: int, old_best_epoch: int):
     """ 返回是否有提升
     """
@@ -112,3 +99,10 @@ def visualize_result(result: dict, show: bool = False):
 
     if show:
         plt.show()
+
+
+def masked_softmax(x, mask, **kwargs):
+    x_masked = x.clone()
+    x_masked[mask == 0.] = -float("inf")
+
+    return torch.softmax(x_masked, **kwargs)

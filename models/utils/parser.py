@@ -50,8 +50,10 @@ def parse_args():
 
     parser.add_argument('--gpus', nargs='?', default='0', help='available GPUs')
 
+    # KG Embedding 任务权重
     parser.add_argument('--weight_task_kg', type=float, default=0.5,
                         help="weight of KG Loss in multi-task learning")
+
     parser.add_argument('--weight_L2_kg', type=float, default=1e-5,
                         help="weight of L2 regularization of KG Embedding")
 

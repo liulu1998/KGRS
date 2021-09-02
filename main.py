@@ -1,21 +1,18 @@
 import os
-import heapq
 import random
 import logging
-import multiprocessing
-
 import torch
 from torch import optim
 from torch.utils.data import DataLoader
 import numpy as np
-
 from models.KGRS import KGRS
-from models.utils import metrics
 from models.utils.parser import parse_args
+from models.utils.evaluate import evaluate
 from models.utils.dataset import DatasetKGRS, TestDataset
 from models.utils.log_helper import create_log_id, logging_config
 
-cores = multiprocessing.cpu_count() // 2
+cores = 32
+# cores = multiprocessing.cpu_count() // 2
 
 test_set = None
 
@@ -27,90 +24,6 @@ def set_seed(seed):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
-
-
-def test_one_user(x):
-    global test_set
-    Ks = [10, 20, 40]
-    # user u's ratings for user u
-    rating = x[0]
-    # uid
-    u = x[1]
-    try:
-        # user u's items in the training set
-        training_items = test_set.train_user_dict[u]
-    except:
-        training_items = []
-
-    # user u's items in the test set
-    user_pos_test = test_set.test_user_dict[u]
-
-    n_items = len(test_set.item_ids)
-    all_items = set(range(n_items))
-
-    test_items = list(all_items - set(training_items))
-
-    item_score = {}
-    for i in test_items:
-        item_score[i] = rating[i]
-
-    # Top-K items for this user
-    K_max = max(Ks)
-    K_max_item_score = heapq.nlargest(K_max, item_score, key=item_score.get)
-
-    r = []
-    for i in K_max_item_score:
-        if i in user_pos_test:
-            r.append(1)
-        else:
-            r.append(0)
-
-    recall_list, ndcg_list = [], []
-
-    for K in Ks:
-        recall_list.append(metrics.recall_at_k(r, K, len(user_pos_test)))
-        ndcg_list.append(metrics.ndcg_at_k(r, K))
-
-    return {'recall': np.array(recall_list), 'ndcg': np.array(ndcg_list)}
-
-
-def evaluate(model, test_set: TestDataset, test_loader: DataLoader, K=(10, 20, 40)):
-    """
-    :param model:
-    :param test_set:
-    :param test_loader:
-    :param K: Top-K
-    """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    res = {'recall': np.zeros(len(K)), 'ndcg': np.zeros(len(K))}
-
-    n_test_users = test_set.n_users
-
-    pool = multiprocessing.Pool(cores)
-
-    for user_batch in test_loader:
-        user_batch = user_batch.to(device)
-
-        rate_batch = model(
-            "predict",
-            r_test=test_set.relation_test,
-            t_test=test_set.tail_test,
-            pos_items=test_set.item_ids,
-            users=user_batch
-        ).squeeze_().cpu().numpy()
-
-        user_batch = user_batch.cpu().numpy()
-        user_batch_rating_uid = zip(rate_batch, user_batch)
-
-        # [dict]
-        batch_result = pool.map(test_one_user, user_batch_rating_uid)
-
-        for re in batch_result:
-            res['recall'] += re['recall'] / n_test_users
-            res['ndcg'] += re['ndcg'] / n_test_users
-
-    pool.close()
-    return res
 
 
 def train_and_test(args):
@@ -130,7 +43,7 @@ def train_and_test(args):
         dataset=dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=2,
+        num_workers=4,
         pin_memory=True
     )
 
@@ -154,15 +67,12 @@ def train_and_test(args):
     # lr decay
     # scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[30, 70], gamma=0.6)
 
-    # train
+    # >> train
     epochs = args.epochs
-
     for epoch in range(epochs):
-        tot_sum = 0.
-        kg_sum = 0.
-        cf_sum = 0.
+        tot_sum, kg_sum, cf_sum = 0., 0., 0.
         steps = 0
-
+        model.train()
         for d in train_loader:
             # load data
             item_batch, user_batch, relation_batch, tail_batch = d
@@ -174,7 +84,7 @@ def train_and_test(args):
 
             optimizer.zero_grad()
             tot_loss, kg_loss, cf_loss = model(
-                "cal_loss",
+                mode="cal_loss",
                 input_i=item_batch,
                 input_iu=user_batch,
                 input_hr=relation_batch,
@@ -189,41 +99,45 @@ def train_and_test(args):
             steps += 1
         # <<< train_loader
         avg_train_loss, avg_kg_loss, avg_cf_loss = tot_sum / steps, kg_sum / steps, cf_sum / steps
-        logging.info(f"epoch {epoch + 1} total loss={avg_train_loss: .2f} KG loss={avg_kg_loss :.2f} CF loss={avg_cf_loss :.2f}")
+        logging.info(
+            f"epoch {epoch + 1} total loss={avg_train_loss: .2f} KG loss={avg_kg_loss :.2f} CF loss={avg_cf_loss :.2f}")
     # << train
 
-    # prepare test data
+    # >> test
+    # test data
+    item_ids = torch.arange(n_items, dtype=torch.long).to(device)
+
     relation_test, tail_test = dataset.prepare_test()
     relation_test = relation_test.to(device)
     tail_test = tail_test.to(device)
 
-    item_ids = torch.arange(n_items, dtype=torch.long).to(device)
-    test_set = TestDataset(args=args, whether_test=True,
-                           item_ids=item_ids, relation_test=relation_test, tail_test=tail_test)
+    test_set = TestDataset(args, whether_test=True, item_ids=item_ids, relation_test=relation_test, tail_test=tail_test)
     test_loader = DataLoader(dataset=test_set, batch_size=args.test_batch_size,
-                             num_workers=1, pin_memory=True, shuffle=False)
-    K = eval(args.Ks)
+                             num_workers=4, pin_memory=True, shuffle=False)
 
-    # test
+    Ks = eval(args.Ks)
     model.eval()
     with torch.no_grad():
-        res = evaluate(
+        logging.info(f"epoch {epoch + 1} evaluate..")
+        # val_result = evaluate(
+        #     model=model,
+        #     users_to_test=np.array(list(test_set.test_user_dict.keys())),
+        #     item_test=test_set.item_ids,
+        #     r_test=relation_test,
+        #     t_test=tail_test,
+        #     K=[10, 20, 40]
+        # )
+        # logging.info(val_result)
+
+        recall_ks, ndcg_ks = evaluate(
             model=model,
-            test_set=test_set,
-            test_loader=test_loader,
-            K=K
+            test_set=test_set, test_loader=test_loader, K=Ks
         )
-
-    logging.info(f"test results:")
-    msg = "Recall"
-    for k, r in zip(K, res["recall"]):
-        msg += f" @{k}={r: .4f}"
-    logging.info(msg)
-
-    msg = "NDCG  "
-    for k, n in zip(K, res["ndcg"]):
-        msg += f" @{k}={n: .4f}"
-    logging.info(msg)
+        for i, k in enumerate(Ks):
+            logging.info(f"epoch {epoch + 1} Recall @{k}={recall_ks[i].item() :.4f}")
+        for i, k in enumerate(Ks):
+            logging.info(f"epoch {epoch + 1} NDCG   @{k}={ndcg_ks[i].item() :.4f}")
+    # << test
 
 
 if __name__ == '__main__':

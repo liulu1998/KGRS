@@ -46,8 +46,9 @@ def dcg_at_k(rel, k):
     rel: list, element is positive real values, can be binary
     """
     rel = np.asfarray(rel)[:k]
-    dcg = np.sum((2 ** rel - 1) / np.log2(np.arange(2, rel.size + 2)))
-    return dcg
+    # dcg = np.sum((2 ** rel - 1) / np.log2(np.arange(2, rel.size + 2)))
+    # return dcg
+    return np.sum(rel / np.log2(np.arange(2, rel.size + 2)))
 
 
 def ndcg_at_k(rel, k):
@@ -67,20 +68,19 @@ def ndcg_at_k_batch(hits, k):
     hits: array, element is binary (0 / 1), 2-dim
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # top K 推荐列表
-    hits_k = hits[:, :k]
+    hits_k = hits[:, :k]    # Top K
+
     # dcg = np.sum((2 ** hits_k - 1) / np.log2(np.arange(2, k + 2)), axis=1)
-    denominator = torch.log2(torch.arange(2, k + 2, dtype=torch.double)).to(device)
+    denominator = torch.log2(torch.arange(2, hits.shape[1] + 2)).to(device)
     dcg = torch.sum(hits_k / denominator, dim=1)
 
-    # 升序排序, 再在 横向反转为 降序排序, 取 top K
     sorted_hits_k, _ = torch.sort(hits_k, dim=1, descending=True)
-    # sorted_hits_k = np.flip(np.sort(hits), axis=1)[:, :k]
     # idcg = np.sum((2 ** sorted_hits_k - 1) / np.log2(np.arange(2, k + 2)), axis=1)
+    # idcg = np.sum((sorted_hits_k / denominator), axis=1)
     idcg = torch.sum(sorted_hits_k / denominator, dim=1)
-    idcg[idcg == 0] = np.inf
 
-    res = (dcg / idcg)
+    epsilon = 1e-9
+    res = dcg / (idcg + epsilon)
     return res
 
 
@@ -93,13 +93,14 @@ def recall_at_k(hit, k, all_pos_num):
     return np.sum(hit) / all_pos_num
 
 
-def recall_at_k_batch(hits, k):
+def recall_at_k_batch(hits, pos_nums, k):
     """
     calculate Recall@k
     hits: array, element is binary (0 / 1), 2-dim
     """
-    res = (hits[:, :k].sum(axis=1) / hits.sum(axis=1))
-    # res = (torch.sum(hits[:, :k], dim=1, keepdim=False) / torch.sum(hits, dim=1))
+    # res = (hits[:, :k].sum(axis=1) / hits.sum(axis=1))
+    res = hits[:, :k].sum(axis=1) / pos_nums
+    # res = torch.sum(hits, dim=1, keepdim=False) / pos_nums
     return res
 
 
@@ -123,48 +124,60 @@ def logloss(ground_truth, prediction):
     return logloss
 
 
-def calc_metrics_at_k(cf_scores, train_user_dict, test_user_dict, user_ids, item_ids, K):
+def calc_metrics_at_ks(cf_scores, train_user_dict, test_user_dict, user_ids, item_ids, Ks):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    test_pos_item_binary = torch.zeros(size=[len(user_ids), len(item_ids)], dtype=torch.float32).to(device)
+    label = torch.zeros(size=[len(user_ids), len(item_ids)]).to(device)
+
+    # 每个用户的正样本数
+    pos_nums = torch.zeros(len(user_ids)).to(device)
 
     for i, u in enumerate(user_ids):
         uid = u.item()
-        train_pos_item_list = train_user_dict[uid]
+        train_pos_items = train_user_dict[uid]
         # cf_scores 中, train set 出现过的 item, score 改为 负无穷
-        cf_scores[i][train_pos_item_list] = -float('inf')
+        cf_scores[i][train_pos_items] = float('-inf')
+
         # test set 中的 ground truth, 标记为 1
-        test_pos_item_list = test_user_dict[uid]
-        test_pos_item_binary[i][test_pos_item_list] = 1.0
+        test_pos_items = test_user_dict[uid]    # list
+        label[i][test_pos_items] = 1.0
+
+        pos_nums[i] = len(test_pos_items)
 
     # rank_indices 是 排序后的 items 各自在 cf_scores 里的下标（即 推荐的商品列表，按照喜好自大到小排序）
-    _, rank_indices = torch.sort(cf_scores, descending=True)
-    # _, rank_indices = torch.topk(cf_scores, dim=1, k=K, largest=True, sorted=True)
+    # _, rank_indices = torch.sort(cf_scores, descending=True)
+    max_k = max(Ks)
+    _, rank_indices = torch.topk(cf_scores, dim=1, k=max_k, largest=True, sorted=True)  # (batch, max_K)
 
     # Q: binary_hit 怎么变成 二值的 ?   A: test_pos_item_binary : ground truth = 1, 其余没有交互的都为 0
     binary_hit = []
     # test_pos_item_binary[i] : 第 i 个用户的 y_true (test set 上所有物品的 ground truth)
     # rank_indices[i] : 第 i 个用户的 商品推荐列表
     for i in range(len(user_ids)):
-        binary_hit.append(test_pos_item_binary[i][rank_indices[i]])
+        binary_hit.append(label[i][rank_indices[i]])
+    # binary_hit 代表推荐列表中的每个商品 是否命中
+    binary_hit = torch.stack(binary_hit)    # list of tensor, 用 torch.stack 直接转成新 tensor
+    # (batch, max_K)
 
-    # binary_hit 代表推荐列表中的每个商品 是否真的是 pos_item (y_pred)
-    binary_hit = np.array([item.cpu().numpy() for item in binary_hit])
+    recall_batch_ks = []
+    ndcg_batch_ks = []
 
-    # print(binary_hit.shape)
+    for k in Ks:
+        recall_batch = recall_at_k_batch(binary_hit, pos_nums, k)
+        ndcg_batch = ndcg_at_k_batch(binary_hit, k)
+        recall_batch_ks.append(recall_batch)
+        ndcg_batch_ks.append(ndcg_batch)
 
-    # binary_hit = torch.tensor(binary_hit, dtype=torch.float32)
-
-    recall = recall_at_k_batch(binary_hit, K)
-    # ndcg = ndcg_at_k_batch(binary_hit, K)
-
-    ndcg = ndcg_at_k(binary_hit, K)
-    return recall, ndcg
+    return torch.stack(recall_batch_ks), torch.stack(ndcg_batch_ks)
 
 
-def evaluate_torch_at_K(model, test_set, test_loader, K):
+def evaluate(model, test_set, test_loader, Ks=(10, 20, 40)):
+    """
+    evaluate model using PyTorch purely, runs on GPU, faster that multiprocessing
+    :return: recall_ks, ndcg_ks
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    recall = []
-    ndcg = []
+    recall_ks = torch.zeros(len(Ks))
+    ndcg_ks = torch.zeros(len(Ks))
 
     for i, user_batch in enumerate(test_loader):
         user_batch = user_batch.to(device)
@@ -174,24 +187,17 @@ def evaluate_torch_at_K(model, test_set, test_loader, K):
             users=user_batch,
             r_test=test_set.relation_test,
             t_test=test_set.tail_test
-        ).squeeze_()
+        ).squeeze_()    # [batch, n_items]
 
-        # if i == 0:
-        #     record = cf_scores_batch[0][:20]
-        #     print(record)
+        recall_batch_ks, ndcg_batch_ks = calc_metrics_at_ks(
+                cf_scores=cf_scores_batch, train_user_dict=test_set.train_user_dict,
+                test_user_dict=test_set.test_user_dict, user_ids=user_batch,
+                item_ids=test_set.item_ids, Ks=Ks
+        )   # [ len(Ks), batch ],   [ len(Ks), batch ]
 
-        # cf_scores 存在负值
-        # (n_batch_users, n_eval_items)
-        recall_batch, ndcg_batch = calc_metrics_at_k(
-            cf_scores_batch, test_set.train_user_dict,
-            test_set.test_user_dict, user_batch,
-            test_set.item_ids, K
-        )
-        recall.append(recall_batch)
-        ndcg.append(ndcg_batch)
+        recall_ks += torch.sum(recall_batch_ks, dim=1).cpu()
+        ndcg_ks += torch.sum(ndcg_batch_ks, dim=1).cpu()
 
-    # recall_k = torch.sum(torch.cat(recall, dim=0)) / test_set.n_users
-    # ndcg_k = torch.sum(torch.cat(ndcg, dim=0)) / test_set.n_users
-    recall_k = np.concatenate(recall, axis=0).sum() / test_set.n_users
-    ndcg_k = np.concatenate(ndcg, axis=0).sum() / test_set.n_users
-    return recall_k, ndcg_k
+    recall_ks /= test_set.n_users   # [ len(Ks) ]
+    ndcg_ks /= test_set.n_users
+    return recall_ks, ndcg_ks

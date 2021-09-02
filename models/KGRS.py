@@ -68,13 +68,15 @@ class GATLayer(nn.Module):
         :param mask: (batch, max_i_r)
         """
         score = self.activation(self.W(r * t) + self.bias)
+        # masked softmax
         score = torch.exp(torch.einsum("abc, ck->abk", score, self.h))
-        score = torch.einsum("ab, abc->abc", mask, score)
+        score = torch.einsum("ab, abc->abc", mask, score)  # (batch, max_i_r, 1)
 
-        score_sum = torch.sum(score, dim=1, keepdim=True)
         # softmax
-        weight = torch.div(score, score_sum)
-        # weight: (batch, max_i_r, 1)
+        score_sum = torch.sum(score, dim=1, keepdim=True)  # (batch, 1, 1)
+        # add epsilon to prevent division by zero
+        weight = torch.div(score, score_sum + 1e-9)  # (batch, max_i_r, 1)
+
         item_neighbors = torch.sum(torch.mul(weight, t), dim=1)
 
         if not self.aggregator:
@@ -198,6 +200,8 @@ class KGRS(nn.Module):
         self.GAT = GAT(in_dim=self.emb_size, hid_dim=self.attention_size, heads=self.n_heads, dropout=dropout_kg,
                        aggregator_type=aggregator_type)
         self.init_weights()
+        self.hardtanh = nn.Hardtanh()
+        self.cf_hardtanh = nn.Hardtanh(min_val=0., max_val=1.)
 
     def init_weights(self):
         # init Embedding layers
@@ -229,17 +233,17 @@ class KGRS(nn.Module):
         h_t = self.Head(t_set)
 
         # StayPositive loss
-        score_all = torch.mean(torch.stack([
-            torch.einsum("ad,bd,cd->abc", item, r, t),
-            torch.einsum("ad,bd,cd->abc", item_inv, r_inv, h_t)
-        ]), dim=0)
+        # score_all = torch.mean(torch.stack([
+        #     torch.einsum("ad,bd,cd->abc", item, r, t),
+        #     torch.einsum("ad,bd,cd->abc", item_inv, r_inv, h_t)
+        # ]), dim=0)
 
-        # score_all = torch.sum(torch.mean(
-        #     torch.stack([
-        #         torch.sum(item, dim=0) * torch.sum(r, dim=0) * torch.sum(t, dim=0),
-        #         torch.sum(item_inv, dim=0) * torch.sum(r_inv, dim=0) * torch.sum(h_t, dim=0),
-        #     ])
-        # ))
+        score_all = torch.sum(torch.mean(
+            torch.stack([
+                torch.sum(item, dim=0) * torch.sum(r, dim=0) * torch.sum(t, dim=0),
+                torch.sum(item_inv, dim=0) * torch.sum(r_inv, dim=0) * torch.sum(h_t, dim=0),
+            ])
+        ))
         # pos loss + regularization term
         loss_kg = torch.sum(F.softplus(-(score + self.psi), threshold=200)) + self.alpha * torch.norm(score_all, p=1)
         return loss_kg
@@ -281,12 +285,13 @@ class KGRS(nn.Module):
         t_emb = torch.einsum("ab, abc->abc", mask, t_emb)
 
         # >>> cal items embedding
-        item_emb = self.Head(pos_items)
+        item_emb = self.Head(pos_items).squeeze_()
         item_emb = self.GAT(item=item_emb, r=r_emb, t=t_emb, mask=mask)
 
         r_inv_emb = self.R_inv(r_test)
         t_h_emb = self.Head(t_test)
-        item_emb_inv = self.Tail(pos_items)
+
+        item_emb_inv = self.Tail(pos_items).squeeze_()
         item_emb_inv = self.GAT(item=item_emb_inv, r=r_inv_emb, t=t_h_emb, mask=mask)
 
         # information fusion
@@ -295,8 +300,14 @@ class KGRS(nn.Module):
 
         user_emb = self.User(users)
         dot = torch.einsum("ac, bc->abc", user_emb, item_emb)
+
         # user-item preference
         pre = torch.einsum("ajk, kl->ajl", dot, self.pre_vec)
+        if torch.any(torch.isnan(pre)):
+            raise ValueError("NaN value in user-item preference !")
+
+        # TODO 激活到 [0, 1] ?
+        pre = self.cf_hardtanh(pre)
         return pre
 
     def infer(self, input_i, input_iu, input_hr, input_ht):
@@ -342,7 +353,8 @@ class KGRS(nn.Module):
         pos_hrt_inv = torch.einsum("ac, abc->ab", item_t_emb_kg, pos_rt_inv).squeeze_()  # (batch_size, max_i_r)
 
         # tuples' score
-        tuple_score = torch.mean(torch.stack([pos_hrt, pos_hrt_inv]), dim=0)  # (batch_size, max_i_r)
+        # TODO 激活 ?
+        tuple_score = self.hardtanh(torch.mean(torch.stack([pos_hrt, pos_hrt_inv]), dim=0))  # (batch_size, max_i_r)
         # <<< SimplE scoring function
 
         # loss on Knowledge Graph Embedding task
@@ -373,7 +385,8 @@ class KGRS(nn.Module):
         # predict user-item preference
         pos_iu = torch.einsum("ac, abc->abc", item_emb_qv, user_emb)
         pos_iu = torch.einsum("ajk, kl->ajl", pos_iu, self.pre_vec)
-        pos_iu = torch.reshape(pos_iu, [-1, self.max_i_u])
+        # TODO 激活到 [0, 1] ?
+        pos_iu = self.cf_hardtanh(torch.reshape(pos_iu, [-1, self.max_i_u]))
 
         # loss on User Preference Prediction task
         loss_cf = self.cal_squared_cf_loss(pre=pos_iu, item=item_emb_qv, weight=c)
